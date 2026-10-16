@@ -95,7 +95,7 @@ static void nextNormalMip(nvtt::Surface& normal)
         for (std::size_t i = 0; i < oldCount; ++i)
             values[i] = values[i] * 2.0f - 1.0f;
     }
-    if (!normal.buildNextMipmap(nvtt::MipmapFilter_Box))
+    if (!normal.buildNextMipmap(nvtt::MipmapFilter_Kaiser))
         throw std::runtime_error("Cannot generate normal mip.");
     float* x = normal.channel(0);
     float* y = normal.channel(1);
@@ -168,7 +168,7 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
         save(context, diffuse, diffuseOutput, nvtt::Format_DXT1,
              [](nvtt::Surface& image) {
                  image.toLinearFromSrgb();
-                 if (!image.buildNextMipmap(nvtt::MipmapFilter_Kaiser))
+                 if (!image.buildNextMipmap(nvtt::MipmapFilter_Box))
                      throw std::runtime_error("Cannot generate diffuse mip.");
                  image.toSrgb();
                  const auto pixels = static_cast<std::size_t>(image.width()) * image.height();
@@ -183,7 +183,7 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
         save(context, packed, bumpOutput, nvtt::Format_DXT5,
              [&](nvtt::Surface& image) {
                  nextNormalMip(normal);
-                 if (!gloss.buildNextMipmap(nvtt::MipmapFilter_Box))
+                 if (!gloss.buildNextMipmap(nvtt::MipmapFilter_Kaiser))
                      throw std::runtime_error("Cannot generate gloss mip.");
                  packBump(image, normal, gloss);
              });

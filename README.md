@@ -56,10 +56,10 @@ previously compressed DDS level.
 
 | Data | Filter | Processing |
 | --- | --- | --- |
-| Diffuse RGB | Kaiser | sRGB to linear, filter, return to sRGB |
+| Diffuse RGB | Box | sRGB to linear, filter, return to sRGB |
 | Diffuse A | Constant | Force 1 at every level |
-| Bump R (gloss) | Box | Filter linear scalar data; clamp to [0,1] |
-| Bump G/B/A (normal Z/Y/X) | Box | Decode vectors, average, normalize, encode |
+| Bump R (gloss) | Kaiser | Filter linear scalar data; clamp to [0,1] |
+| Bump G/B/A (normal Z/Y/X) | Kaiser | Decode vectors, average, normalize, encode |
 
 Normal and gloss images stay separate while filtering. Each bump mip is
 packed afterward with the same RGBA layout as the base. DirectX Y direction
