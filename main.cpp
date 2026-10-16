@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <fstream>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
@@ -114,6 +115,131 @@ static void nextNormalMip(nvtt::Surface& normal)
     }
 }
 
+// Tee the actual encoded payload to disk and retain just the current mip.
+class CapturedDDS final : public nvtt::OutputHandler {
+public:
+    explicit CapturedDDS(const fs::path& path) : file(path, std::ios::binary) {
+        if (!file)
+            throw std::runtime_error("Cannot open DDS: " + path.string());
+    }
+    void beginImage(int size, int, int, int, int, int) override {
+        bytes.clear();
+        if (size > 0)
+            bytes.reserve(static_cast<std::size_t>(size));
+    }
+    bool writeData(const void* data, int size) override {
+        if (size < 0)
+            return false;
+        const auto* first = static_cast<const char*>(data);
+        file.write(first, size);
+        if (capture && size > 0)
+            bytes.insert(bytes.end(), first, first + size);
+        return static_cast<bool>(file);
+    }
+    void endImage() override {}
+    void finish() {
+        file.close();
+        if (!file)
+            throw std::runtime_error("Cannot finish bump DDS write.");
+    }
+    bool capture = false;
+    std::vector<char> bytes;
+private:
+    std::ofstream file;
+};
+
+static int toByte(float value)
+{
+    return static_cast<int>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+}
+
+static void makeCorrection(nvtt::Surface& correction, const nvtt::Surface& original,
+                           const nvtt::Surface& decoded)
+{
+    if (!correction.setImage(original.width(), original.height(), 1))
+        throw std::runtime_error("Cannot allocate correction mip.");
+    const auto pixels = static_cast<std::size_t>(original.width()) * original.height();
+    // Packed bump A/B/G contain normal X/Y/Z; correction stores X/Y/Z in RGB.
+    const int sourceChannels[] = {3, 2, 1};
+    for (int c = 0; c < 3; ++c) {
+        const float* source = original.channel(sourceChannels[c]);
+        const float* restored = decoded.channel(sourceChannels[c]);
+        float* target = correction.channel(c);
+        for (std::size_t i = 0; i < pixels; ++i) {
+            const int error = 128 + 2 * (toByte(source[i]) - toByte(restored[i]));
+            target[i] = std::clamp(error, 0, 255) / 255.0f;
+        }
+    }
+    float* height = correction.channel(3);
+    std::fill(height, height + pixels, 0.5f);
+    correction.setNormalMap(false);
+    correction.setAlphaMode(nvtt::AlphaMode_Transparency);
+}
+
+static void saveBumpPair(nvtt::Context& context, nvtt::Surface& normal,
+                         nvtt::Surface& specular, const fs::path& bumpPath,
+                         const fs::path& correctionPath)
+{
+    nvtt::Surface packed;
+    packBump(packed, normal, specular);
+    const int mipCount = packed.countMipmaps();
+    nvtt::CompressionOptions compression;
+    compression.setFormat(nvtt::Format_DXT5);
+    compression.setQuality(nvtt::Quality_Normal);
+
+    CapturedDDS bumpFile(bumpPath);
+    nvtt::OutputOptions bumpOutput;
+    bumpOutput.setContainer(nvtt::Container_DDS);
+    bumpOutput.setSrgbFlag(false);
+    bumpOutput.setOutputHandler(&bumpFile);
+
+    nvtt::OutputOptions correctionOutput;
+    correctionOutput.setContainer(nvtt::Container_DDS);
+    correctionOutput.setSrgbFlag(false);
+    correctionOutput.setFileName(correctionPath.string().c_str());
+    nvtt::Surface correction, decoded;
+    if (!correction.setImage(packed.width(), packed.height(), 1))
+        throw std::runtime_error("Cannot allocate correction texture.");
+    correction.setAlphaMode(nvtt::AlphaMode_Transparency);
+    if (!context.outputHeader(packed, mipCount, compression, bumpOutput)
+        || !context.outputHeader(correction, mipCount, compression, correctionOutput))
+        throw std::runtime_error("Cannot write bump/correction DDS headers.");
+    bumpFile.capture = true; // Header is on disk, but never part of a mip payload.
+
+    const auto started = std::chrono::steady_clock::now();
+    std::cerr << "Compressing " << bumpPath.filename().string() << " and "
+              << correctionPath.filename().string() << " (DXT5 Normal, "
+              << mipCount << " mips)..." << std::endl;
+    for (int mip = 0; mip < mipCount; ++mip) {
+        std::cerr << "  Mip " << mip << ": " << packed.width() << 'x' << packed.height()
+                  << " bump + correction" << std::endl;
+        bumpFile.bytes.clear();
+        if (!context.compress(packed, 0, mip, compression, bumpOutput))
+            throw std::runtime_error("Cannot compress bump mip.");
+        const auto expectedBytes = static_cast<std::size_t>((packed.width() + 3) / 4)
+                                 * ((packed.height() + 3) / 4) * 16;
+        if (bumpFile.bytes.size() != expectedBytes)
+            throw std::runtime_error("Unexpected DXT5 mip payload size.");
+        // Decode with NVTT 3; these are the exact bytes written above.
+        if (!decoded.setImage2D(nvtt::Format_DXT5,
+                                packed.width(), packed.height(), bumpFile.bytes.data()))
+            throw std::runtime_error("Cannot decode compressed bump mip.");
+        makeCorrection(correction, packed, decoded);
+        if (!context.compress(correction, 0, mip, compression, correctionOutput))
+            throw std::runtime_error("Cannot compress bump correction mip.");
+        if (mip + 1 < mipCount) {
+            nextNormalMip(normal);
+            if (!specular.buildNextMipmap(nvtt::MipmapFilter_Box))
+                throw std::runtime_error("Cannot generate specular mip.");
+            packBump(packed, normal, specular);
+        }
+    }
+    bumpFile.finish();
+    std::cerr << "Bump/correction compression finished in "
+              << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
+              << " seconds." << std::endl;
+}
+
 static const std::array<std::string, 3> suffixes = {"_diffuse", "_normal", "_specular"};
 
 static void convert(nvtt::Context& context, const std::array<fs::path, 3>& inputs,
@@ -178,20 +304,9 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
         std::cout << diffuseOutput.string() << '\n';
     }
     if (createBump) {
-        nvtt::Surface packed;
-        packBump(packed, normal, specular);
-        save(context, packed, bumpOutput, nvtt::Format_DXT5,
-             [&](nvtt::Surface& image) {
-                 nextNormalMip(normal);
-                 if (!specular.buildNextMipmap(nvtt::MipmapFilter_Box))
-                     throw std::runtime_error("Cannot generate specular mip.");
-                 float* spec = specular.channel(0);
-                 const auto pixels = static_cast<std::size_t>(specular.width()) * specular.height();
-                 for (std::size_t i = 0; i < pixels; ++i)
-                     spec[i] = std::clamp(spec[i], 0.0f, 1.0f);
-                 packBump(image, normal, specular);
-             });
-        std::cout << bumpOutput.string() << '\n';
+        const fs::path correctionOutput = outputDirectory / (base + "_bump#.dds");
+        saveBumpPair(context, normal, specular, bumpOutput, correctionOutput);
+        std::cout << bumpOutput.string() << '\n' << correctionOutput.string() << '\n';
     }
 }
 
@@ -265,7 +380,7 @@ static int convertDirectory(const fs::path& requested)
         }
     }
     std::cerr << "Finished: " << diffuseCount << " diffuse, " << bumpCount
-              << " bump, " << failures << " failure(s)." << std::endl;
+              << " bump/correction pairs, " << failures << " failure(s)." << std::endl;
     return failures == 0 ? 0 : 1;
 }
 
