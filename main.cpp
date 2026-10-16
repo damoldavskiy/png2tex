@@ -6,7 +6,6 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
-#include <fstream>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
@@ -65,7 +64,7 @@ static void save(nvtt::Context& context, nvtt::Surface& image,
 
 // Work in source images; pack only the mip that is about to be compressed.
 static void packBump(nvtt::Surface& packed, const nvtt::Surface& normal,
-                     const nvtt::Surface& specular)
+                     const nvtt::Surface& gloss)
 {
     if (!packed.setImage(normal.width(), normal.height(), 1))
         throw std::runtime_error("Cannot allocate bump mip.");
@@ -77,9 +76,9 @@ static void packBump(nvtt::Surface& packed, const nvtt::Surface& normal,
     const float* nx = normal.channel(0);
     const float* ny = normal.channel(1);
     const float* nz = normal.channel(2);
-    const float* spec = specular.channel(0);
+    const float* glossValues = gloss.channel(0);
     for (std::size_t i = 0; i < count; ++i) {
-        r[i] = std::clamp(spec[i], 0.0f, 1.0f);
+        r[i] = std::clamp(glossValues[i], 0.0f, 1.0f);
         g[i] = nz[i];
         b[i] = ny[i];
         a[i] = nx[i];
@@ -115,132 +114,7 @@ static void nextNormalMip(nvtt::Surface& normal)
     }
 }
 
-// Tee the actual encoded payload to disk and retain just the current mip.
-class CapturedDDS final : public nvtt::OutputHandler {
-public:
-    explicit CapturedDDS(const fs::path& path) : file(path, std::ios::binary) {
-        if (!file)
-            throw std::runtime_error("Cannot open DDS: " + path.string());
-    }
-    void beginImage(int size, int, int, int, int, int) override {
-        bytes.clear();
-        if (size > 0)
-            bytes.reserve(static_cast<std::size_t>(size));
-    }
-    bool writeData(const void* data, int size) override {
-        if (size < 0)
-            return false;
-        const auto* first = static_cast<const char*>(data);
-        file.write(first, size);
-        if (capture && size > 0)
-            bytes.insert(bytes.end(), first, first + size);
-        return static_cast<bool>(file);
-    }
-    void endImage() override {}
-    void finish() {
-        file.close();
-        if (!file)
-            throw std::runtime_error("Cannot finish bump DDS write.");
-    }
-    bool capture = false;
-    std::vector<char> bytes;
-private:
-    std::ofstream file;
-};
-
-static int toByte(float value)
-{
-    return static_cast<int>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
-}
-
-static void makeCorrection(nvtt::Surface& correction, const nvtt::Surface& original,
-                           const nvtt::Surface& decoded)
-{
-    if (!correction.setImage(original.width(), original.height(), 1))
-        throw std::runtime_error("Cannot allocate correction mip.");
-    const auto pixels = static_cast<std::size_t>(original.width()) * original.height();
-    // Packed bump A/B/G contain normal X/Y/Z; correction stores X/Y/Z in RGB.
-    const int sourceChannels[] = {3, 2, 1};
-    for (int c = 0; c < 3; ++c) {
-        const float* source = original.channel(sourceChannels[c]);
-        const float* restored = decoded.channel(sourceChannels[c]);
-        float* target = correction.channel(c);
-        for (std::size_t i = 0; i < pixels; ++i) {
-            const int error = 128 + 2 * (toByte(source[i]) - toByte(restored[i]));
-            target[i] = std::clamp(error, 0, 255) / 255.0f;
-        }
-    }
-    float* height = correction.channel(3);
-    std::fill(height, height + pixels, 0.5f);
-    correction.setNormalMap(false);
-    correction.setAlphaMode(nvtt::AlphaMode_Transparency);
-}
-
-static void saveBumpPair(nvtt::Context& context, nvtt::Surface& normal,
-                         nvtt::Surface& specular, const fs::path& bumpPath,
-                         const fs::path& correctionPath)
-{
-    nvtt::Surface packed;
-    packBump(packed, normal, specular);
-    const int mipCount = packed.countMipmaps();
-    nvtt::CompressionOptions compression;
-    compression.setFormat(nvtt::Format_DXT5);
-    compression.setQuality(nvtt::Quality_Normal);
-
-    CapturedDDS bumpFile(bumpPath);
-    nvtt::OutputOptions bumpOutput;
-    bumpOutput.setContainer(nvtt::Container_DDS);
-    bumpOutput.setSrgbFlag(false);
-    bumpOutput.setOutputHandler(&bumpFile);
-
-    nvtt::OutputOptions correctionOutput;
-    correctionOutput.setContainer(nvtt::Container_DDS);
-    correctionOutput.setSrgbFlag(false);
-    correctionOutput.setFileName(correctionPath.string().c_str());
-    nvtt::Surface correction, decoded;
-    if (!correction.setImage(packed.width(), packed.height(), 1))
-        throw std::runtime_error("Cannot allocate correction texture.");
-    correction.setAlphaMode(nvtt::AlphaMode_Transparency);
-    if (!context.outputHeader(packed, mipCount, compression, bumpOutput)
-        || !context.outputHeader(correction, mipCount, compression, correctionOutput))
-        throw std::runtime_error("Cannot write bump/correction DDS headers.");
-    bumpFile.capture = true; // Header is on disk, but never part of a mip payload.
-
-    const auto started = std::chrono::steady_clock::now();
-    std::cerr << "Compressing " << bumpPath.filename().string() << " and "
-              << correctionPath.filename().string() << " (DXT5 Normal, "
-              << mipCount << " mips)..." << std::endl;
-    for (int mip = 0; mip < mipCount; ++mip) {
-        std::cerr << "  Mip " << mip << ": " << packed.width() << 'x' << packed.height()
-                  << " bump + correction" << std::endl;
-        bumpFile.bytes.clear();
-        if (!context.compress(packed, 0, mip, compression, bumpOutput))
-            throw std::runtime_error("Cannot compress bump mip.");
-        const auto expectedBytes = static_cast<std::size_t>((packed.width() + 3) / 4)
-                                 * ((packed.height() + 3) / 4) * 16;
-        if (bumpFile.bytes.size() != expectedBytes)
-            throw std::runtime_error("Unexpected DXT5 mip payload size.");
-        // Decode with NVTT 3; these are the exact bytes written above.
-        if (!decoded.setImage2D(nvtt::Format_DXT5,
-                                packed.width(), packed.height(), bumpFile.bytes.data()))
-            throw std::runtime_error("Cannot decode compressed bump mip.");
-        makeCorrection(correction, packed, decoded);
-        if (!context.compress(correction, 0, mip, compression, correctionOutput))
-            throw std::runtime_error("Cannot compress bump correction mip.");
-        if (mip + 1 < mipCount) {
-            nextNormalMip(normal);
-            if (!specular.buildNextMipmap(nvtt::MipmapFilter_Box))
-                throw std::runtime_error("Cannot generate specular mip.");
-            packBump(packed, normal, specular);
-        }
-    }
-    bumpFile.finish();
-    std::cerr << "Bump/correction compression finished in "
-              << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
-              << " seconds." << std::endl;
-}
-
-static const std::array<std::string, 3> suffixes = {"_diffuse", "_normal", "_specular"};
+static const std::array<std::string, 3> suffixes = {"_diffuse", "_normal", "_gloss"};
 
 static void convert(nvtt::Context& context, const std::array<fs::path, 3>& inputs,
                     const fs::path& outputDirectory, const std::string& outputBase = {})
@@ -248,19 +122,19 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
     const bool createDiffuse = !inputs[0].empty();
     const bool createBump = !inputs[1].empty() && !inputs[2].empty();
     if (inputs[1].empty() != inputs[2].empty() || (!createDiffuse && !createBump))
-        throw std::runtime_error("Supply diffuse alone, normal + specular, or all three.");
+        throw std::runtime_error("Supply diffuse alone, normal + gloss, or all three.");
     const std::size_t namingRole = createDiffuse ? 0 : 1;
     std::string base = inputs[namingRole].stem().string();
     base.resize(base.size() - suffixes[namingRole].size());
     if (!outputBase.empty())
         base = outputBase;
-    nvtt::Surface diffuse, normal, specular;
+    nvtt::Surface diffuse, normal, gloss;
     if (createDiffuse)
         load(diffuse, inputs[0]);
     if (createBump) {
         load(normal, inputs[1]);
-        load(specular, inputs[2]);
-        if (normal.width() != specular.width() || normal.height() != specular.height()
+        load(gloss, inputs[2]);
+        if (normal.width() != gloss.width() || normal.height() != gloss.height()
             || (createDiffuse && (diffuse.width() != normal.width() || diffuse.height() != normal.height())))
             throw std::runtime_error("All supplied inputs must have identical dimensions.");
     }
@@ -279,9 +153,9 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
         // These working images contain data, never transparency.
         normal.setAlphaMode(nvtt::AlphaMode_None);
         normal.setNormalMap(false);
-        specular.setAlphaMode(nvtt::AlphaMode_None);
-        specular.setNormalMap(false);
-        for (nvtt::Surface* image : {&normal, &specular}) {
+        gloss.setAlphaMode(nvtt::AlphaMode_None);
+        gloss.setNormalMap(false);
+        for (nvtt::Surface* image : {&normal, &gloss}) {
             float* alpha = image->channel(3);
             std::fill(alpha, alpha + count, 1.0f);
         }
@@ -304,9 +178,16 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
         std::cout << diffuseOutput.string() << '\n';
     }
     if (createBump) {
-        const fs::path correctionOutput = outputDirectory / (base + "_bump#.dds");
-        saveBumpPair(context, normal, specular, bumpOutput, correctionOutput);
-        std::cout << bumpOutput.string() << '\n' << correctionOutput.string() << '\n';
+        nvtt::Surface packed;
+        packBump(packed, normal, gloss);
+        save(context, packed, bumpOutput, nvtt::Format_DXT5,
+             [&](nvtt::Surface& image) {
+                 nextNormalMip(normal);
+                 if (!gloss.buildNextMipmap(nvtt::MipmapFilter_Box))
+                     throw std::runtime_error("Cannot generate gloss mip.");
+                 packBump(image, normal, gloss);
+             });
+        std::cout << bumpOutput.string() << '\n';
     }
 }
 
@@ -364,15 +245,15 @@ static int convertDirectory(const fs::path& requested)
             return found == pngs.end() ? fs::path{} : found->second;
         };
         const fs::path normal = companion(suffixes[1]);
-        const fs::path specular = companion(suffixes[2]);
-        if (normal.empty() || specular.empty()) {
-            if (normal.empty() != specular.empty())
+        const fs::path gloss = companion(suffixes[2]);
+        if (normal.empty() || gloss.empty()) {
+            if (normal.empty() != gloss.empty())
                 std::cerr << "Skipping bump for " << relative.string()
-                          << ": both normal and specular PNGs are required." << std::endl;
+                          << ": both normal and gloss PNGs are required." << std::endl;
             continue;
         }
         try {
-            convert(context, {fs::path{}, normal, specular}, destination, base);
+            convert(context, {fs::path{}, normal, gloss}, destination, base);
             ++bumpCount;
         } catch (const std::exception& error) {
             std::cerr << "png2tex: bump for " << diffuse.string() << ": " << error.what() << std::endl;
@@ -380,7 +261,7 @@ static int convertDirectory(const fs::path& requested)
         }
     }
     std::cerr << "Finished: " << diffuseCount << " diffuse, " << bumpCount
-              << " bump/correction pairs, " << failures << " failure(s)." << std::endl;
+              << " bump, " << failures << " failure(s)." << std::endl;
     return failures == 0 ? 0 : 1;
 }
 
@@ -389,8 +270,8 @@ int main(int argc, char** argv)
     if (argc < 2 || argc > 4) {
         std::cerr << "Usage: png2tex <name_diffuse.png>\n"
                   << "   or: png2tex <directory>\n"
-                  << "   or: png2tex <name_normal.png> <name_specular.png>\n"
-                  << "   or: png2tex <name_diffuse.png> <name_normal.png> <name_specular.png>\n";
+                  << "   or: png2tex <name_normal.png> <name_gloss.png>\n"
+                  << "   or: png2tex <name_diffuse.png> <name_normal.png> <name_gloss.png>\n";
         return 1;
     }
 
@@ -417,7 +298,7 @@ int main(int argc, char** argv)
                     break;
             }
             if (role == suffixes.size())
-                throw std::runtime_error("Expected _diffuse, _normal or _specular suffix: " + path.string());
+                throw std::runtime_error("Expected _diffuse, _normal or _gloss suffix: " + path.string());
             if (!inputs[role].empty())
                 throw std::runtime_error("Duplicate input role: " + suffixes[role]);
 
