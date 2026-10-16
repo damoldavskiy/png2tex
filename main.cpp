@@ -4,6 +4,8 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cmath>
+#include <functional>
 #include <cstddef>
 #include <filesystem>
 #include <iostream>
@@ -28,8 +30,9 @@ static void load(nvtt::Surface& image, const fs::path& path)
         throw std::runtime_error("Cannot decode PNG: " + path.string());
 }
 
-static void save(nvtt::Context& context, const nvtt::Surface& image,
-                 const fs::path& path, nvtt::Format format)
+static void save(nvtt::Context& context, nvtt::Surface& image,
+                 const fs::path& path, nvtt::Format format,
+                 const std::function<void(nvtt::Surface&)>& nextMip)
 {
     nvtt::CompressionOptions compression;
     compression.setFormat(format);
@@ -39,17 +42,76 @@ static void save(nvtt::Context& context, const nvtt::Surface& image,
     output.setContainer(nvtt::Container_DDS); // Legacy header for DX8 loaders.
     output.setSrgbFlag(false); // Legacy DDS has no DXGI sRGB format tag.
     output.setFileName(path.string().c_str());
+    const int mipCount = image.countMipmaps();
     std::cerr << "Compressing " << path.filename().string() << " ("
               << image.width() << 'x' << image.height()
               << ", " << (format == nvtt::Format_DXT1 ? "DXT1" : "DXT5")
-              << " Normal)..." << std::endl;
+              << " Normal, " << mipCount << " mips)..." << std::endl;
     const auto started = std::chrono::steady_clock::now();
-    if (!context.outputHeader(image, 1, compression, output)
-        || !context.compress(image, 0, 0, compression, output))
-        throw std::runtime_error("Cannot write DDS: " + path.string());
+    if (!context.outputHeader(image, mipCount, compression, output))
+        throw std::runtime_error("Cannot write DDS header: " + path.string());
+    for (int mip = 0; mip < mipCount; ++mip) {
+        std::cerr << "  Mip " << mip << ": " << image.width() << 'x' << image.height() << std::endl;
+        if (!context.compress(image, 0, mip, compression, output))
+            throw std::runtime_error("Cannot write DDS mip: " + path.string());
+        if (mip + 1 < mipCount)
+            nextMip(image);
+    }
     std::cerr << "Compression finished in "
               << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
               << " seconds." << std::endl;
+}
+
+// Work in source images; pack only the mip that is about to be compressed.
+static void packBump(nvtt::Surface& packed, const nvtt::Surface& normal,
+                     const nvtt::Surface& specular)
+{
+    if (!packed.setImage(normal.width(), normal.height(), 1))
+        throw std::runtime_error("Cannot allocate bump mip.");
+    const std::size_t count = static_cast<std::size_t>(normal.width()) * normal.height();
+    float* r = packed.channel(0);
+    float* g = packed.channel(1);
+    float* b = packed.channel(2);
+    float* a = packed.channel(3);
+    const float* nx = normal.channel(0);
+    const float* ny = normal.channel(1);
+    const float* nz = normal.channel(2);
+    const float* spec = specular.channel(0);
+    for (std::size_t i = 0; i < count; ++i) {
+        r[i] = std::clamp(spec[i], 0.0f, 1.0f);
+        g[i] = nz[i];
+        b[i] = ny[i];
+        a[i] = nx[i];
+    }
+    packed.setAlphaMode(nvtt::AlphaMode_Transparency);
+    packed.setNormalMap(false);
+}
+
+static void nextNormalMip(nvtt::Surface& normal)
+{
+    const auto oldCount = static_cast<std::size_t>(normal.width()) * normal.height();
+    for (int c = 0; c < 3; ++c) {
+        float* values = normal.channel(c);
+        for (std::size_t i = 0; i < oldCount; ++i)
+            values[i] = values[i] * 2.0f - 1.0f;
+    }
+    if (!normal.buildNextMipmap(nvtt::MipmapFilter_Box))
+        throw std::runtime_error("Cannot generate normal mip.");
+    float* x = normal.channel(0);
+    float* y = normal.channel(1);
+    float* z = normal.channel(2);
+    const auto count = static_cast<std::size_t>(normal.width()) * normal.height();
+    for (std::size_t i = 0; i < count; ++i) {
+        const float length = std::sqrt(x[i]*x[i] + y[i]*y[i] + z[i]*z[i]);
+        if (length > 1.0e-8f) {
+            x[i] /= length; y[i] /= length; z[i] /= length;
+        } else {
+            x[i] = 0.0f; y[i] = 0.0f; z[i] = 1.0f;
+        }
+        x[i] = x[i]*0.5f + 0.5f;
+        y[i] = y[i]*0.5f + 0.5f;
+        z[i] = z[i]*0.5f + 0.5f;
+    }
 }
 
 static const std::array<std::string, 3> suffixes = {"_diffuse", "_normal", "_specular"};
@@ -88,32 +150,47 @@ static void convert(nvtt::Context& context, const std::array<fs::path, 3>& input
         diffuse.setAlphaMode(nvtt::AlphaMode_None);
     }
     if (createBump) {
-        float* nx = normal.channel(0);
-        float* ny = normal.channel(1);
-        float* nz = normal.channel(2);
-        float* na = normal.channel(3);
-        const float* spec = specular.channel(0);
-        for (std::size_t i = 0; i < count; ++i) {
-            const float x = nx[i], y = ny[i], z = nz[i];
-            nx[i] = spec[i];
-            ny[i] = z;
-            nz[i] = y;
-            na[i] = x;
+        // These working images contain data, never transparency.
+        normal.setAlphaMode(nvtt::AlphaMode_None);
+        normal.setNormalMap(false);
+        specular.setAlphaMode(nvtt::AlphaMode_None);
+        specular.setNormalMap(false);
+        for (nvtt::Surface* image : {&normal, &specular}) {
+            float* alpha = image->channel(3);
+            std::fill(alpha, alpha + count, 1.0f);
         }
-        // No premultiplication or filtering; alpha contains normal X.
-        normal.setAlphaMode(nvtt::AlphaMode_Transparency);
-        normal.setNormalMap(false); // Already packed; no normal-specific swizzle.
     }
 
     fs::create_directories(outputDirectory);
     const fs::path diffuseOutput = outputDirectory / (base + ".dds");
     const fs::path bumpOutput = outputDirectory / (base + "_bump.dds");
     if (createDiffuse) {
-        save(context, diffuse, diffuseOutput, nvtt::Format_DXT1);
+        save(context, diffuse, diffuseOutput, nvtt::Format_DXT1,
+             [](nvtt::Surface& image) {
+                 image.toLinearFromSrgb();
+                 if (!image.buildNextMipmap(nvtt::MipmapFilter_Kaiser))
+                     throw std::runtime_error("Cannot generate diffuse mip.");
+                 image.toSrgb();
+                 const auto pixels = static_cast<std::size_t>(image.width()) * image.height();
+                 float* alpha = image.channel(3);
+                 std::fill(alpha, alpha + pixels, 1.0f);
+             });
         std::cout << diffuseOutput.string() << '\n';
     }
     if (createBump) {
-        save(context, normal, bumpOutput, nvtt::Format_DXT5);
+        nvtt::Surface packed;
+        packBump(packed, normal, specular);
+        save(context, packed, bumpOutput, nvtt::Format_DXT5,
+             [&](nvtt::Surface& image) {
+                 nextNormalMip(normal);
+                 if (!specular.buildNextMipmap(nvtt::MipmapFilter_Box))
+                     throw std::runtime_error("Cannot generate specular mip.");
+                 float* spec = specular.channel(0);
+                 const auto pixels = static_cast<std::size_t>(specular.width()) * specular.height();
+                 for (std::size_t i = 0; i < pixels; ++i)
+                     spec[i] = std::clamp(spec[i], 0.0f, 1.0f);
+                 packBump(image, normal, specular);
+             });
         std::cout << bumpOutput.string() << '\n';
     }
 }

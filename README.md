@@ -28,16 +28,17 @@ Outputs are saved beside the inputs, using the diffuse basename's spelling when 
 | brick_bump.dds | DXT5 (8 bpp) | specular R | normal B (Z) | normal G (Y) | normal R (X) |
 
 The normal input uses DirectX tangent-space conventions. Its encoded channel
-values are copied without flipping Y or renormalizing. Specular is treated as
+values are copied at the base level without flipping Y or renormalizing. Specular is treated as
 linear scalar data taken from the input's red channel (use a grayscale PNG).
-The diffuse input is assumed to contain sRGB color values; those values are
-not gamma-transformed. Legacy DDS does not carry a DXGI sRGB format tag;
+The diffuse input is assumed to contain sRGB color values. Base-level RGB
+is unchanged before compression; smaller mips are filtered in linear light
+and encoded back to sRGB. Legacy DDS does not carry a DXGI sRGB format tag;
 the renderer controls diffuse color-space handling. Bump channels are linear data.
 
 CUDA acceleration requested, with CPU fallback; NVTT Normal quality.
-Legacy DDS headers (DXT1/DXT5 FourCC), one mip level. Loading, compression
-stages and per-file compression times are printed to stderr.
-No resizing, premultiplication or mipmap generation. DXT1's opaque encoding
+Legacy DDS headers (DXT1/DXT5 FourCC), with full mip chains down to 1x1.
+Loading, each mip index/dimensions and per-file compression times are printed
+to stderr. No base-level resizing or alpha premultiplication. DXT1's opaque encoding
 returns alpha 1. DXT5 preserves all four packed channels, subject to compression
 loss. These formats target DX8; the renderer must check device format support.
 Compression is lossy; "copied" describes values supplied to the compressor.
@@ -45,6 +46,27 @@ Compression is lossy; "copied" describes values supplied to the compressor.
 Existing outputs are overwritten. A failed conversion can leave a partial
 output or only the first DDS. Exit status is 0 on success, 1 on failure.
 Paths must be representable by the platform's narrow filename API.
+
+## Mipmap generation
+
+Every output contains the full mip chain, including 2x2 and 1x1 levels.
+For example, 2048x2048 produces 12 levels, including the original.
+Each level is compressed from uncompressed working data, never from a
+previously compressed DDS level.
+
+| Data | Filter | Processing |
+| --- | --- | --- |
+| Diffuse RGB | Kaiser | sRGB to linear, filter, return to sRGB |
+| Diffuse A | Constant | Force 1 at every level |
+| Bump R (specular) | Box | Filter linear scalar data; clamp to [0,1] |
+| Bump G/B/A (normal Z/Y/X) | Box | Decode vectors, average, normalize, encode |
+
+Normal and specular images stay separate while filtering. Each bump mip is
+packed afterward with the same RGBA layout as the base. DirectX Y direction
+is preserved. A zero-length averaged normal falls back to (0,0,1). Source
+normal vectors are assumed to be valid unit vectors; base-level normal values
+are retained. Each smaller level is generated from the previous uncompressed
+level. NVTT's default filter parameters and edge addressing are used.
 
 ## Directory mode
 
@@ -113,16 +135,15 @@ make its dependencies available to the dynamic loader.
 
 ## Validation
 
-Recursive hierarchy, ordinary and `_raw` output names, companion discovery,
-case-insensitive matching, untouched inputs, repeated runs, error continuation,
-empty-directory handling and existing CLI modes passed with a test double.
+Application checks passed using an NVTT test double: full mip count and indices,
+rectangular tails down to 1x1, Kaiser diffuse / Box normal and specular selection, linear-light diffuse
+processing, normal vector normalization and zero-vector fallback, specular
+clamping, channel packing, all explicit CLI modes and recursive directory mode.
+Previous directory naming, companion matching and input validation checks also
+passed before this mipmap change.
 
-CLI validation and precompression channel packing passed checks using a test
-double (including reordered inputs, duplicates and mismatched dimensions).
-All three modes, every valid input ordering, invalid role combinations,
-bump-only dimension mismatches, and preservation of an existing diffuse file
-in bump-only mode passed with an NVTT test double.
-This checks application logic, not SDK compatibility or compression.
-The channel access follows NVIDIA's NVTT 3 to_slope_space sample. The authoring
-environment does not have NVTT installed, so a real SDK build, DXT1/DXT5 encoding and alpha/data
-preservation and end-to-end conversion still need verification on the target.
+The test double models downsampling with averaging; it does not validate NVTT's
+actual Kaiser kernel, compression quality, DDS headers, or binary compatibility.
+The mip-writing API follows NVIDIA's NVTT 3 mipmap sample. The proprietary SDK
+is not installed in the authoring environment, so an actual SDK build and
+end-to-end DDS conversion still need verification on the target machine.
