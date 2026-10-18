@@ -8,12 +8,9 @@ png2tex brick_normal.png brick_gloss.png
 png2tex brick_diffuse.png brick_normal.png brick_gloss.png
 ```
 
-With one _diffuse.png input, only <name>.dds is generated. No normal or
-gloss files are searched for or loaded; an existing bump DDS is left alone.
-With normal + gloss inputs, only <name>_bump.dds is generated; diffuse is
-not loaded or written, and any existing diffuse DDS is left alone.
-A normal or gloss input always requires its partner. Single normal/gloss
-inputs and diffuse + only one of those inputs are rejected.
+With one _diffuse.png input, only <name>.dds is generated.
+With normal + gloss inputs, only <name>_bump.dds is generated.
+A normal or gloss input always requires its partner.
 
 All inputs must share a basename, directory and dimensions. Filename suffixes
 and extensions are matched case-insensitively. Width and height must be
@@ -51,8 +48,7 @@ Paths must be representable by the platform's narrow filename API.
 
 Every output contains the full mip chain, including 2x2 and 1x1 levels.
 For example, 2048x2048 produces 12 levels, including the original.
-Each level is compressed from uncompressed working data, never from a
-previously compressed DDS level.
+Each level is compressed from uncompressed working data.
 
 | Data | Filter | Processing |
 | --- | --- | --- |
@@ -132,14 +128,3 @@ Pass the directory containing nvtt/nvtt.h as NVTT_INCLUDE_DIR and the actual
 SDK import/shared library as NVTT_LIBRARY. SDK binaries are not included.
 On Linux use a compatible C++17 compiler, omit -A x64, link the SDK .so, and
 make its dependencies available to the dynamic loader.
-
-## Validation
-
-Application checks use an NVTT test double, not the actual SDK codec.
-Checks cover diffuse-only, normal/gloss, full-set and directory modes;
-_gloss suffix discovery and argument ordering; packed bump channel values;
-full mip chains and filter selection; and preservation of existing outputs
-that are not requested by the selected mode.
-
-The proprietary SDK is not installed in the authoring environment, so a real
-SDK build and end-to-end DDS conversion still need verification on the target.
